@@ -37,7 +37,7 @@
     "@types/xml2js": "catalog:"
   },
   "dependencies": {
-    "@langchain/core": "catalog:",
+    "@langchain/core": "0.3.80",
     "@n8n/client-oauth2": "workspace:*",
     "@n8n/config": "workspace:*",
     "@n8n/di": "workspace:*",
