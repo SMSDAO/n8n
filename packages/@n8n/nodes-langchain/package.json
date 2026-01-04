@@ -143,7 +143,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-sso-oidc": "3.666.0",
-    "@getzep/zep-cloud": "1.0.12",
+    "@getzep/zep-cloud": "2.3.0",
     "@getzep/zep-js": "0.9.0",
     "@google-ai/generativelanguage": "2.6.0",
     "@google-cloud/resource-manager": "5.3.0",
@@ -176,7 +176,7 @@
     "@xata.io/client": "0.28.4",
     "basic-auth": "catalog:",
     "cheerio": "1.0.0",
-    "cohere-ai": "7.14.0",
+    "cohere-ai": "7.18.0",
     "d3-dsv": "2.0.0",
     "epub2": "3.0.2",
     "form-data": "catalog:",
