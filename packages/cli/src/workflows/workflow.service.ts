@@ -1,4 +1,21 @@
+import { Logger } from '@n8n/backend-common';
 import { GlobalConfig } from '@n8n/config';
+import type {
+	User,
+	WorkflowEntity,
+	ListQueryDb,
+	WorkflowFolderUnionFull,
+	WorkflowHistoryUpdate,
+} from '@n8n/db';
+import {
+	SharedWorkflow,
+	ExecutionRepository,
+	FolderRepository,
+	WorkflowTagMappingRepository,
+	SharedWorkflowRepository,
+	WorkflowRepository,
+	WorkflowPublishHistoryRepository,
+} from '@n8n/db';
 import { Service } from '@n8n/di';
 import type { Scope } from '@n8n/permissions';
 // eslint-disable-next-line n8n-local-rules/misplaced-n8n-typeorm-import
@@ -6,37 +23,32 @@ import type { EntityManager } from '@n8n/typeorm';
 // eslint-disable-next-line n8n-local-rules/misplaced-n8n-typeorm-import
 import { In } from '@n8n/typeorm';
 import type { QueryDeepPartialEntity } from '@n8n/typeorm/query-builder/QueryPartialEntity';
+import isEqual from 'lodash/isEqual';
 import omit from 'lodash/omit';
 import pick from 'lodash/pick';
-import { BinaryDataService, Logger } from 'n8n-core';
-import { NodeApiError, PROJECT_ROOT } from 'n8n-workflow';
+import { FileLocation, BinaryDataService } from 'n8n-core';
+import { NodeApiError, PROJECT_ROOT, assert } from 'n8n-workflow';
 import { v4 as uuid } from 'uuid';
 
 import { ActiveWorkflowManager } from '@/active-workflow-manager';
-import config from '@/config';
-import { SharedWorkflow } from '@/databases/entities/shared-workflow';
-import type { User } from '@/databases/entities/user';
-import type { WorkflowEntity } from '@/databases/entities/workflow-entity';
-import { ExecutionRepository } from '@/databases/repositories/execution.repository';
-import { SharedWorkflowRepository } from '@/databases/repositories/shared-workflow.repository';
-import { WorkflowTagMappingRepository } from '@/databases/repositories/workflow-tag-mapping.repository';
-import type { WorkflowFolderUnionFull } from '@/databases/repositories/workflow.repository';
-import { WorkflowRepository } from '@/databases/repositories/workflow.repository';
+import { FolderNotFoundError } from '@/errors/folder-not-found.error';
 import { BadRequestError } from '@/errors/response-errors/bad-request.error';
 import { NotFoundError } from '@/errors/response-errors/not-found.error';
+import { WorkflowHistoryVersionNotFoundError } from '@/errors/workflow-history-version-not-found.error';
 import { EventService } from '@/events/event.service';
 import { ExternalHooks } from '@/external-hooks';
 import { validateEntity } from '@/generic-helpers';
-import { hasSharing, type ListQuery } from '@/requests';
-import { FolderService } from '@/services/folder.service';
-import { OrchestrationService } from '@/services/orchestration.service';
+import type { ListQuery } from '@/requests';
+import { hasSharing } from '@/requests';
 import { OwnershipService } from '@/services/ownership.service';
+// eslint-disable-next-line import-x/no-cycle
 import { ProjectService } from '@/services/project.service.ee';
 import { RoleService } from '@/services/role.service';
 import { TagService } from '@/services/tag.service';
 import * as WorkflowHelpers from '@/workflow-helpers';
 
-import { WorkflowHistoryService } from './workflow-history.ee/workflow-history.service.ee';
+import { WorkflowFinderService } from './workflow-finder.service';
+import { WorkflowHistoryService } from './workflow-history/workflow-history.service';
 import { WorkflowSharingService } from './workflow-sharing.service';
 
 @Service()
@@ -50,7 +62,6 @@ export class WorkflowService {
 		private readonly ownershipService: OwnershipService,
 		private readonly tagService: TagService,
 		private readonly workflowHistoryService: WorkflowHistoryService,
-		private readonly orchestrationService: OrchestrationService,
 		private readonly externalHooks: ExternalHooks,
 		private readonly activeWorkflowManager: ActiveWorkflowManager,
 		private readonly roleService: RoleService,
@@ -59,7 +70,9 @@ export class WorkflowService {
 		private readonly executionRepository: ExecutionRepository,
 		private readonly eventService: EventService,
 		private readonly globalConfig: GlobalConfig,
-		private readonly folderService: FolderService,
+		private readonly folderRepository: FolderRepository,
+		private readonly workflowFinderService: WorkflowFinderService,
+		private readonly workflowPublishHistoryRepository: WorkflowPublishHistoryRepository,
 	) {}
 
 	async getMany(
@@ -67,14 +80,31 @@ export class WorkflowService {
 		options?: ListQuery.Options,
 		includeScopes?: boolean,
 		includeFolders?: boolean,
+		onlySharedWithMe?: boolean,
 	) {
 		let count;
 		let workflows;
 		let workflowsAndFolders: WorkflowFolderUnionFull[] = [];
+		let sharedWorkflowIds: string[] = [];
+		let isPersonalProject = false;
 
-		const sharedWorkflowIds = await this.workflowSharingService.getSharedWorkflowIds(user, {
-			scopes: ['workflow:read'],
-		});
+		if (options?.filter?.projectId) {
+			const projects = await this.projectService.getProjectRelationsForUser(user);
+			isPersonalProject = !!projects.find(
+				(p) => p.project.id === options.filter?.projectId && p.project.type === 'personal',
+			);
+		}
+
+		if (isPersonalProject) {
+			sharedWorkflowIds =
+				await this.workflowSharingService.getOwnedWorkflowsInPersonalProject(user);
+		} else if (onlySharedWithMe) {
+			sharedWorkflowIds = await this.workflowSharingService.getSharedWithMeIds(user);
+		} else {
+			sharedWorkflowIds = await this.workflowSharingService.getSharedWorkflowIds(user, {
+				scopes: ['workflow:read'],
+			});
+		}
 
 		if (includeFolders) {
 			[workflowsAndFolders, count] = await this.workflowRepository.getWorkflowsAndFoldersWithCount(
@@ -118,7 +148,7 @@ export class WorkflowService {
 	}
 
 	private async processSharedWorkflows(
-		workflows: ListQuery.Workflow.WithSharing[],
+		workflows: ListQueryDb.Workflow.WithSharing[],
 		options?: ListQuery.Options,
 	) {
 		const projectId = options?.filter?.projectId;
@@ -132,7 +162,7 @@ export class WorkflowService {
 		return workflows.map((workflow) => this.ownershipService.addOwnedByAndSharedWith(workflow));
 	}
 
-	private async addSharedRelation(workflows: ListQuery.Workflow.WithSharing[]): Promise<void> {
+	private async addSharedRelation(workflows: ListQueryDb.Workflow.WithSharing[]): Promise<void> {
 		const workflowIds = workflows.map((workflow) => workflow.id);
 		const relations = await this.sharedWorkflowRepository.getAllRelationsForWorkflows(workflowIds);
 
@@ -142,7 +172,7 @@ export class WorkflowService {
 	}
 
 	private async addUserScopes(
-		workflows: ListQuery.Workflow.Plain[] | ListQuery.Workflow.WithSharing[],
+		workflows: ListQueryDb.Workflow.Plain[] | ListQueryDb.Workflow.WithSharing[],
 		user: User,
 	) {
 		const projectRelations = await this.projectService.getProjectRelationsForUser(user);
@@ -153,7 +183,7 @@ export class WorkflowService {
 	}
 
 	private cleanupSharedField(
-		workflows: ListQuery.Workflow.Plain[] | ListQuery.Workflow.WithSharing[],
+		workflows: ListQueryDb.Workflow.Plain[] | ListQueryDb.Workflow.WithSharing[],
 	): void {
 		/*
 			This is to emulate the old behavior of removing the shared field as
@@ -167,7 +197,7 @@ export class WorkflowService {
 
 	private mergeProcessedWorkflows(
 		workflowsAndFolders: WorkflowFolderUnionFull[],
-		processedWorkflows: ListQuery.Workflow.Plain[] | ListQuery.Workflow.WithSharing[],
+		processedWorkflows: ListQueryDb.Workflow.Plain[] | ListQueryDb.Workflow.WithSharing[],
 	) {
 		const workflowMap = new Map(processedWorkflows.map((workflow) => [workflow.id, workflow]));
 
@@ -176,18 +206,41 @@ export class WorkflowService {
 		);
 	}
 
+	/**
+	 * Updates the workflow content (such as name, nodes, connections, settings, etc.).
+	 *
+	 * This method never updates the workflow's active fields (active, activeVersionId) directly.
+	 * However, if settings change and the workflow has an active version, the workflow will be
+	 * automatically reactivated to ensure the ActiveWorkflowManager uses the updated settings.
+	 * For explicit activation or deactivation, use the activate/deactivate methods.
+	 */
+
 	// eslint-disable-next-line complexity
 	async update(
 		user: User,
 		workflowUpdateData: WorkflowEntity,
 		workflowId: string,
-		tagIds?: string[],
-		parentFolderId?: string,
-		forceSave?: boolean,
+		options: {
+			tagIds?: string[];
+			parentFolderId?: string;
+			forceSave?: boolean;
+			publicApi?: boolean;
+			publishIfActive?: boolean;
+		} = {},
 	): Promise<WorkflowEntity> {
-		const workflow = await this.sharedWorkflowRepository.findWorkflowForUser(workflowId, user, [
-			'workflow:update',
-		]);
+		const {
+			tagIds,
+			parentFolderId,
+			forceSave = false,
+			publicApi = false,
+			publishIfActive = false,
+		} = options;
+		const workflow = await this.workflowFinderService.findWorkflowForUser(
+			workflowId,
+			user,
+			['workflow:update'],
+			{ includeActiveVersion: true },
+		);
 
 		if (!workflow) {
 			this.logger.warn('User attempted to update a workflow without permissions', {
@@ -210,9 +263,15 @@ export class WorkflowService {
 			);
 		}
 
-		if (Object.keys(omit(workflowUpdateData, ['id', 'versionId', 'active'])).length > 0) {
+		if (
+			Object.keys(omit(workflowUpdateData, ['id', 'versionId', 'active', 'activeVersionId']))
+				.length > 0
+		) {
 			// Update the workflow's version when changing properties such as
 			// `name`, `pinData`, `nodes`, `connections`, `settings` or `tags`
+			// This is necessary for collaboration to work properly - even when only name or settings
+			// change, we need to update the version to detect conflicts when multiple users are editing.
+
 			workflowUpdateData.versionId = uuid();
 			this.logger.debug(
 				`Updating versionId for workflow ${workflowId} for user ${user.id} after saving`,
@@ -223,26 +282,36 @@ export class WorkflowService {
 			);
 		}
 
+		const versionChanged =
+			workflowUpdateData.versionId && workflowUpdateData.versionId !== workflow.versionId;
+
+		if (versionChanged) {
+			// To save a version, we need both nodes and connections
+			workflowUpdateData.nodes = workflowUpdateData.nodes ?? workflow.nodes;
+			workflowUpdateData.connections = workflowUpdateData.connections ?? workflow.connections;
+		}
+
 		// check credentials for old format
 		await WorkflowHelpers.replaceInvalidCredentials(workflowUpdateData);
 
 		WorkflowHelpers.addNodeIds(workflowUpdateData);
 
-		await this.externalHooks.run('workflow.update', [workflowUpdateData]);
-
-		/**
-		 * If the workflow being updated is stored as `active`, remove it from
-		 * active workflows in memory, and re-add it after the update.
-		 *
-		 * If a trigger or poller in the workflow was updated, the new value
-		 * will take effect only on removing and re-adding.
-		 */
-		if (workflow.active) {
-			await this.activeWorkflowManager.remove(workflowId);
+		// Merge settings to support partial updates
+		if (workflowUpdateData.settings && workflow.settings) {
+			workflowUpdateData.settings = {
+				...workflow.settings,
+				...workflowUpdateData.settings,
+			};
 		}
 
-		const workflowSettings = workflowUpdateData.settings ?? {};
+		// Check if settings actually changed
+		const settingsChanged =
+			workflowUpdateData.settings !== undefined &&
+			!isEqual(workflow.settings, workflowUpdateData.settings);
 
+		await this.externalHooks.run('workflow.update', [workflowUpdateData]);
+
+		const workflowSettings = workflowUpdateData.settings ?? {};
 		const keysAllowingDefault = [
 			'timezone',
 			'saveDataErrorExecution',
@@ -257,19 +326,20 @@ export class WorkflowService {
 			}
 		}
 
-		if (workflowSettings.executionTimeout === config.get('executions.timeout')) {
+		if (workflowSettings.executionTimeout === this.globalConfig.executions.timeout) {
 			// Do not save when default got set
 			delete workflowSettings.executionTimeout;
 		}
 
+		// Always set updatedAt to get millisecond precision
+		workflowUpdateData.updatedAt = new Date();
+
 		if (workflowUpdateData.name) {
-			workflowUpdateData.updatedAt = new Date(); // required due to atomic update
 			await validateEntity(workflowUpdateData);
 		}
 
-		const updatePayload: QueryDeepPartialEntity<WorkflowEntity> = pick(workflowUpdateData, [
+		const fieldsToUpdate = [
 			'name',
-			'active',
 			'nodes',
 			'connections',
 			'meta',
@@ -277,26 +347,46 @@ export class WorkflowService {
 			'staticData',
 			'pinData',
 			'versionId',
-		]);
+			'description',
+			'updatedAt',
+			// do not update active fields
+		];
+
+		const updatePayload = pick(
+			workflowUpdateData,
+			fieldsToUpdate,
+		) as QueryDeepPartialEntity<WorkflowEntity>;
+
+		// Save the workflow to history first, so we can retrieve the complete version object for the update
+		if (versionChanged) {
+			await this.workflowHistoryService.saveVersion(user, workflowUpdateData, workflowId);
+		}
+
+		const publishCurrent = workflow.activeVersionId && publishIfActive;
+		if (publishCurrent) {
+			updatePayload.active = true;
+			updatePayload.activeVersionId = workflowUpdateData.versionId;
+		}
 
 		if (parentFolderId) {
 			const project = await this.sharedWorkflowRepository.getWorkflowOwningProject(workflow.id);
 			if (parentFolderId !== PROJECT_ROOT) {
-				await this.folderService.findFolderInProjectOrFail(parentFolderId, project?.id ?? '');
+				try {
+					await this.folderRepository.findOneOrFailFolderInProject(
+						parentFolderId,
+						project?.id ?? '',
+					);
+				} catch (e) {
+					throw new FolderNotFoundError(parentFolderId);
+				}
 			}
 			updatePayload.parentFolder = parentFolderId === PROJECT_ROOT ? null : { id: parentFolderId };
 		}
-
 		await this.workflowRepository.update(workflowId, updatePayload);
-
 		const tagsDisabled = this.globalConfig.tags.disabled;
 
 		if (tagIds && !tagsDisabled) {
 			await this.workflowTagMappingRepository.overwriteTaggings(workflowId, tagIds);
-		}
-
-		if (workflowUpdateData.versionId !== workflow.versionId) {
-			await this.workflowHistoryService.saveVersion(user, workflowUpdateData, workflowId);
 		}
 
 		const relations = tagsDisabled ? [] : ['tags'];
@@ -319,42 +409,246 @@ export class WorkflowService {
 				requestOrder: tagIds,
 			});
 		}
-
 		await this.externalHooks.run('workflow.afterUpdate', [updatedWorkflow]);
 		this.eventService.emit('workflow-saved', {
 			user,
 			workflow: updatedWorkflow,
-			publicApi: false,
+			publicApi,
 		});
 
-		if (updatedWorkflow.active) {
-			// When the workflow is supposed to be active add it again
-			try {
-				await this.externalHooks.run('workflow.activate', [updatedWorkflow]);
-				await this.activeWorkflowManager.add(workflowId, workflow.active ? 'update' : 'activate');
-			} catch (error) {
-				// If workflow could not be activated set it again to inactive
-				// and revert the versionId change so UI remains consistent
-				await this.workflowRepository.update(workflowId, {
-					active: false,
-					versionId: workflow.versionId,
+		// Activate workflow if requested, or
+		// Reactivate workflow if settings changed and workflow has an active version
+		if (updatedWorkflow.activeVersionId && (publishCurrent || settingsChanged)) {
+			await this.activateWorkflow(
+				user,
+				workflowId,
+				{ versionId: updatedWorkflow.activeVersionId },
+				publicApi,
+			);
+		}
+		return updatedWorkflow;
+	}
+
+	/**
+	 * Private helper to add a workflow to the active workflow manager
+	 * @param rollBackOptions - Optional rollback options
+	 */
+	private async _addToActiveWorkflowManager(
+		user: User,
+		workflowId: string,
+		workflow: WorkflowEntity,
+		mode: 'activate' | 'update',
+		publicApi: boolean = false,
+	): Promise<void> {
+		let didPublish = false;
+		try {
+			await this.externalHooks.run('workflow.activate', [workflow]);
+			await this.activeWorkflowManager.add(workflowId, mode);
+			didPublish = true;
+		} catch (error) {
+			const rollbackPayload = {
+				active: false,
+				activeVersionId: null,
+				activeVersion: null,
+			};
+			const previouslyActiveId = workflow.activeVersionId;
+			await this.workflowRepository.update(workflowId, rollbackPayload);
+
+			// Also set it in the returned data
+			workflow.active = rollbackPayload.active;
+			workflow.activeVersionId = rollbackPayload.activeVersionId;
+			workflow.activeVersion = rollbackPayload.activeVersion;
+
+			if (!workflow.activeVersionId) {
+				// Emit deactivation event since activation failed
+				this.eventService.emit('workflow-deactivated', {
+					user,
+					workflowId,
+					workflow,
+					publicApi,
 				});
+				assert(previouslyActiveId !== null);
+				await this.workflowPublishHistoryRepository.addRecord({
+					workflowId,
+					versionId: previouslyActiveId,
+					event: 'deactivated',
+					userId: user.id,
+				});
+			}
+			let message;
+			if (error instanceof NodeApiError) message = error.description;
+			message = message ?? (error as Error).message;
 
-				// Also set it in the returned data
-				updatedWorkflow.active = false;
-
-				let message;
-				if (error instanceof NodeApiError) message = error.description;
-				message = message ?? (error as Error).message;
-
-				// Now return the original error for UI to display
-				throw new BadRequestError(message);
+			// Now return the original error for UI to display
+			throw new BadRequestError(message);
+		} finally {
+			if (didPublish) {
+				assert(workflow.activeVersionId !== null);
+				await this.workflowPublishHistoryRepository.addRecord({
+					workflowId,
+					versionId: workflow.activeVersionId,
+					event: 'activated',
+					userId: user.id,
+				});
 			}
 		}
+	}
 
-		await this.orchestrationService.init();
+	/**
+	 * Activates a workflow by setting its activeVersionId and adding it to the active workflow manager.
+	 * @param user - The user activating the workflow
+	 * @param workflowId - The ID of the workflow to activate
+	 * @param options - Optional versionId, name and description updates
+	 * @param publicApi - Whether this is called from the public API (affects event emission)
+	 * @returns The activated workflow
+	 */
+	async activateWorkflow(
+		user: User,
+		workflowId: string,
+		options?: { versionId?: string; name?: string; description?: string },
+		publicApi: boolean = false,
+	): Promise<WorkflowEntity> {
+		const workflow = await this.workflowFinderService.findWorkflowForUser(
+			workflowId,
+			user,
+			['workflow:update'],
+			{ includeActiveVersion: true },
+		);
+
+		if (!workflow) {
+			this.logger.warn('User attempted to activate a workflow without permissions', {
+				workflowId,
+				userId: user.id,
+			});
+			throw new NotFoundError(
+				'You do not have permission to activate this workflow. Ask the owner to share it with you.',
+			);
+		}
+
+		const versionToActivate = options?.versionId ?? workflow.versionId;
+		const wasActive = workflow.activeVersionId !== null;
+
+		try {
+			await this.workflowHistoryService.getVersion(user, workflow.id, versionToActivate, {
+				includePublishHistory: false,
+			});
+		} catch (error) {
+			if (error instanceof WorkflowHistoryVersionNotFoundError) {
+				throw new NotFoundError('Version not found');
+			}
+			throw error;
+		}
+
+		if (wasActive) {
+			await this.activeWorkflowManager.remove(workflowId);
+		}
+
+		const activationMode = wasActive ? 'update' : 'activate';
+
+		await this.workflowRepository.update(workflowId, {
+			activeVersionId: versionToActivate,
+			active: true,
+			// workflow content did not change, so we keep updatedAt as is
+			updatedAt: workflow.updatedAt,
+		});
+
+		const updatedWorkflow = await this.workflowRepository.findOne({
+			where: { id: workflowId },
+			relations: ['activeVersion'],
+		});
+
+		if (!updatedWorkflow) {
+			throw new NotFoundError(`Workflow with ID "${workflowId}" could not be found.`);
+		}
+
+		this.eventService.emit('workflow-activated', {
+			user,
+			workflowId,
+			workflow: updatedWorkflow,
+			publicApi,
+		});
+
+		await this._addToActiveWorkflowManager(
+			user,
+			workflowId,
+			updatedWorkflow,
+			activationMode,
+			publicApi,
+		);
+
+		if (options?.name !== undefined || options?.description !== undefined) {
+			const updateFields: WorkflowHistoryUpdate = {};
+			if (options.name !== undefined) updateFields.name = options.name;
+			if (options.description !== undefined) updateFields.description = options.description;
+			await this.workflowHistoryService.updateVersion(versionToActivate, workflowId, updateFields);
+		}
 
 		return updatedWorkflow;
+	}
+
+	/**
+	 * Deactivates a workflow by removing it from the active workflow manager and setting activeVersionId to null.
+	 * @param user - The user deactivating the workflow
+	 * @param workflowId - The ID of the workflow to deactivate
+	 * @param publicApi - Whether this is called from the public API (affects event emission)
+	 * @returns The deactivated workflow
+	 */
+	async deactivateWorkflow(
+		user: User,
+		workflowId: string,
+		publicApi: boolean = false,
+	): Promise<WorkflowEntity> {
+		const workflow = await this.workflowFinderService.findWorkflowForUser(
+			workflowId,
+			user,
+			['workflow:update'],
+			{ includeActiveVersion: true },
+		);
+
+		if (!workflow) {
+			this.logger.warn('User attempted to deactivate a workflow without permissions', {
+				workflowId,
+				userId: user.id,
+			});
+			throw new NotFoundError(
+				'You do not have permission to deactivate this workflow. Ask the owner to share it with you.',
+			);
+		}
+
+		if (workflow.activeVersionId === null) {
+			return workflow;
+		}
+
+		// Remove from active workflow manager
+		await this.activeWorkflowManager.remove(workflowId);
+
+		await this.workflowRepository.update(workflowId, {
+			active: false,
+			activeVersionId: null,
+			// workflow content did not change, so we keep updatedAt as is
+			updatedAt: workflow.updatedAt,
+		});
+
+		await this.workflowPublishHistoryRepository.addRecord({
+			workflowId,
+			versionId: workflow.activeVersionId,
+			event: 'deactivated',
+			userId: user.id,
+		});
+
+		// Update the workflow object for response
+		workflow.active = false;
+		workflow.activeVersionId = null;
+		workflow.activeVersion = null;
+
+		this.eventService.emit('workflow-deactivated', {
+			user,
+			workflowId,
+			workflow,
+			publicApi,
+		});
+
+		return workflow;
 	}
 
 	/**
@@ -364,15 +658,19 @@ export class WorkflowService {
 	 * If the user does not have the permissions to delete the workflow this does
 	 * nothing and returns void.
 	 */
-	async delete(user: User, workflowId: string): Promise<WorkflowEntity | undefined> {
+	async delete(user: User, workflowId: string, force = false): Promise<WorkflowEntity | undefined> {
 		await this.externalHooks.run('workflow.delete', [workflowId]);
 
-		const workflow = await this.sharedWorkflowRepository.findWorkflowForUser(workflowId, user, [
+		const workflow = await this.workflowFinderService.findWorkflowForUser(workflowId, user, [
 			'workflow:delete',
 		]);
 
 		if (!workflow) {
 			return;
+		}
+
+		if (!workflow.isArchived && !force) {
+			throw new BadRequestError('Workflow must be archived before it can be deleted.');
 		}
 
 		if (workflow.active) {
@@ -385,13 +683,95 @@ export class WorkflowService {
 				select: ['id'],
 				where: { workflowId },
 			})
-			.then((rows) => rows.map(({ id: executionId }) => ({ workflowId, executionId })));
+			.then((rows) =>
+				rows.map(({ id: executionId }) => FileLocation.ofExecution(workflowId, executionId)),
+			);
 
 		await this.workflowRepository.delete(workflowId);
 		await this.binaryDataService.deleteMany(idsForDeletion);
 
 		this.eventService.emit('workflow-deleted', { user, workflowId, publicApi: false });
 		await this.externalHooks.run('workflow.afterDelete', [workflowId]);
+
+		return workflow;
+	}
+
+	async archive(
+		user: User,
+		workflowId: string,
+		skipArchived: boolean = false,
+	): Promise<WorkflowEntity | undefined> {
+		const workflow = await this.workflowFinderService.findWorkflowForUser(workflowId, user, [
+			'workflow:delete',
+		]);
+
+		if (!workflow) {
+			return;
+		}
+
+		if (workflow.isArchived) {
+			if (skipArchived) {
+				return workflow;
+			}
+
+			throw new BadRequestError('Workflow is already archived.');
+		}
+
+		if (workflow.activeVersionId !== null) {
+			await this.activeWorkflowManager.remove(workflowId);
+			await this.workflowPublishHistoryRepository.addRecord({
+				workflowId,
+				versionId: workflow.activeVersionId,
+				event: 'deactivated',
+				userId: user.id,
+			});
+		}
+
+		const versionId = uuid();
+		workflow.versionId = versionId;
+		workflow.isArchived = true;
+		workflow.active = false;
+		workflow.activeVersionId = null;
+		workflow.activeVersion = null;
+
+		await this.workflowRepository.update(workflowId, {
+			isArchived: true,
+			active: false,
+			activeVersion: null,
+			versionId,
+		});
+
+		await this.workflowHistoryService.saveVersion(user, workflow, workflowId);
+
+		this.eventService.emit('workflow-archived', { user, workflowId, publicApi: false });
+		await this.externalHooks.run('workflow.afterArchive', [workflowId]);
+
+		return workflow;
+	}
+
+	async unarchive(user: User, workflowId: string): Promise<WorkflowEntity | undefined> {
+		const workflow = await this.workflowFinderService.findWorkflowForUser(workflowId, user, [
+			'workflow:delete',
+		]);
+
+		if (!workflow) {
+			return;
+		}
+
+		if (!workflow.isArchived) {
+			throw new BadRequestError('Workflow is not archived.');
+		}
+
+		const versionId = uuid();
+		workflow.versionId = versionId;
+		workflow.isArchived = false;
+
+		await this.workflowRepository.update(workflowId, { isArchived: false, versionId });
+
+		await this.workflowHistoryService.saveVersion(user, workflow, workflowId);
+
+		this.eventService.emit('workflow-unarchived', { user, workflowId, publicApi: false });
+		await this.externalHooks.run('workflow.afterUnarchive', [workflowId]);
 
 		return workflow;
 	}
@@ -459,5 +839,32 @@ export class WorkflowService {
 				role: sw.role,
 			})),
 		);
+	}
+
+	async getWorkflowsWithNodesIncluded(user: User, nodeTypes: string[], includeNodes = false) {
+		const foundWorkflows = await this.workflowRepository.findWorkflowsWithNodeType(
+			nodeTypes,
+			includeNodes,
+		);
+
+		let { workflows } = await this.workflowRepository.getManyAndCount(
+			foundWorkflows.map((w) => w.id),
+		);
+
+		if (hasSharing(workflows)) {
+			workflows = await this.processSharedWorkflows(workflows);
+		}
+
+		const withScopes = await this.addUserScopes(workflows, user);
+
+		this.cleanupSharedField(withScopes);
+
+		return withScopes.map((workflow) => {
+			const nodes = includeNodes
+				? (foundWorkflows.find((w) => w.id === workflow.id)?.nodes ?? [])
+				: undefined;
+
+			return { resourceType: 'workflow', ...workflow, ...(includeNodes ? { nodes } : {}) };
+		});
 	}
 }

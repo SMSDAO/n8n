@@ -1,7 +1,11 @@
 import { Container } from '@n8n/di';
 import fs from 'fs';
 import { mock } from 'jest-mock-extended';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
+import type { UserManagementConfig } from '../src/configs/user-management.config';
+import type { DatabaseConfig } from '../src/index';
 import { GlobalConfig } from '../src/index';
 
 jest.mock('fs');
@@ -25,13 +29,38 @@ describe('GlobalConfig', () => {
 		path: '/',
 		host: 'localhost',
 		port: 5678,
-		listen_address: '0.0.0.0',
+		listen_address: '::',
 		protocol: 'http',
 		auth: {
 			cookie: {
 				samesite: 'lax',
 				secure: true,
 			},
+		},
+		defaultLocale: 'en',
+		hideUsagePage: false,
+		deployment: {
+			type: 'default',
+		},
+		mfa: {
+			enabled: true,
+		},
+		hiringBanner: {
+			enabled: true,
+		},
+		personalization: {
+			enabled: true,
+		},
+		proxy_hops: 0,
+		ssl_key: '',
+		ssl_cert: '',
+		editorBaseUrl: '',
+		dataTable: {
+			maxSize: 50 * 1024 * 1024,
+			sizeCheckCacheDuration: 60000,
+			cleanupIntervalMs: 60 * 1000,
+			fileMaxAgeMs: 2 * 60 * 1000,
+			uploadDir: path.join(tmpdir(), 'n8nDataTableUploads'),
 		},
 		database: {
 			logging: {
@@ -45,6 +74,7 @@ describe('GlobalConfig', () => {
 				password: '',
 				port: 3306,
 				user: 'root',
+				poolSize: 10,
 			},
 			postgresdb: {
 				database: 'n8n',
@@ -62,24 +92,33 @@ describe('GlobalConfig', () => {
 					rejectUnauthorized: true,
 				},
 				user: 'postgres',
+				idleTimeoutMs: 30_000,
 			},
 			sqlite: {
 				database: 'database.sqlite',
-				enableWAL: false,
+				enableWAL: true,
 				executeVacuumOnStartup: false,
-				poolSize: 0,
+				poolSize: 3,
 			},
 			tablePrefix: '',
 			type: 'sqlite',
-		},
+			isLegacySqlite: false,
+			pingIntervalSeconds: 2,
+		} as DatabaseConfig,
 		credentials: {
 			defaultName: 'My credentials',
 			overwrite: {
 				data: '{}',
 				endpoint: '',
+				endpointAuthToken: '',
+				persistence: false,
 			},
 		},
 		userManagement: {
+			inviteLinksEmailOnly: false,
+			jwtSecret: '',
+			jwtSessionDurationHours: 168,
+			jwtRefreshTimeoutHours: 0,
 			emails: {
 				mode: 'smtp',
 				smtp: {
@@ -99,10 +138,12 @@ describe('GlobalConfig', () => {
 					'credentials-shared': '',
 					'user-invited': '',
 					'password-reset-requested': '',
+					'workflow-deactivated': '',
 					'workflow-shared': '',
+					'project-shared': '',
 				},
 			},
-		},
+		} as UserManagementConfig,
 		eventBus: {
 			checkUnsentInterval: 0,
 			crashRecoveryMode: 'extensive',
@@ -115,19 +156,11 @@ describe('GlobalConfig', () => {
 		externalHooks: {
 			files: [],
 		},
-		externalSecrets: {
-			preferGet: false,
-			updateInterval: 300,
-		},
 		nodes: {
-			communityPackages: {
-				enabled: true,
-				registry: 'https://registry.npmjs.org',
-				reinstallMissing: false,
-			},
 			errorTriggerType: 'n8n-nodes-base.errorTrigger',
 			include: [],
-			exclude: [],
+			exclude: ['n8n-nodes-base.executeCommand', 'n8n-nodes-base.localFileTrigger'],
+			pythonEnabled: true,
 		},
 		publicApi: {
 			disabled: false,
@@ -141,32 +174,26 @@ describe('GlobalConfig', () => {
 		versionNotifications: {
 			enabled: true,
 			endpoint: 'https://api.n8n.io/api/versions/',
+			whatsNewEnabled: true,
+			whatsNewEndpoint: 'https://api.n8n.io/api/whats-new',
 			infoUrl: 'https://docs.n8n.io/hosting/installation/updating/',
 		},
-		externalStorage: {
-			s3: {
-				host: '',
-				protocol: 'https',
-				bucket: {
-					name: '',
-					region: '',
-				},
-				credentials: {
-					accessKey: '',
-					accessSecret: '',
-				},
-			},
+		dynamicBanners: {
+			endpoint: 'https://api.n8n.io/api/banners',
+			enabled: true,
 		},
 		workflows: {
 			defaultName: 'My workflow',
 			callerPolicyDefaultOption: 'workflowsFromSameOwner',
 			activationBatchSize: 1,
+			indexingEnabled: false,
 		},
 		endpoints: {
 			metrics: {
 				enable: false,
 				prefix: 'n8n_',
 				includeWorkflowIdLabel: false,
+				includeWorkflowNameLabel: false,
 				includeDefaultMetrics: true,
 				includeMessageEventBusMetrics: false,
 				includeNodeTypeLabel: false,
@@ -179,6 +206,8 @@ describe('GlobalConfig', () => {
 				includeQueueMetrics: false,
 				queueMetricsInterval: 20,
 				activeWorkflowCountInterval: 60,
+				includeWorkflowStatistics: false,
+				workflowStatisticsInterval: 300,
 			},
 			additionalNonUIRoutes: '',
 			disableProductionWebhooksOnMainProcess: false,
@@ -186,6 +215,8 @@ describe('GlobalConfig', () => {
 			form: 'form',
 			formTest: 'form-test',
 			formWaiting: 'form-waiting',
+			mcp: 'mcp',
+			mcpTest: 'mcp-test',
 			payloadSizeMax: 16,
 			formDataFileSizeMax: 200,
 			rest: 'rest',
@@ -208,7 +239,7 @@ describe('GlobalConfig', () => {
 			health: {
 				active: false,
 				port: 5678,
-				address: '0.0.0.0',
+				address: '::',
 			},
 			bull: {
 				redis: {
@@ -225,15 +256,14 @@ describe('GlobalConfig', () => {
 				gracefulShutdownTimeout: 30,
 				prefix: 'bull',
 				settings: {
-					lockDuration: 30_000,
-					lockRenewTime: 15_000,
+					lockDuration: 60_000,
+					lockRenewTime: 10_000,
 					stalledInterval: 30_000,
-					maxStalledCount: 1,
 				},
 			},
 		},
 		taskRunners: {
-			enabled: false,
+			enabled: true,
 			mode: 'internal',
 			path: '/runners',
 			authToken: '',
@@ -243,7 +273,10 @@ describe('GlobalConfig', () => {
 			maxOldSpaceSize: '',
 			maxConcurrency: 10,
 			taskTimeout: 300,
+			taskRequestTimeout: 60,
 			heartbeatInterval: 30,
+			insecureMode: false,
+			isNativePythonRunnerEnabled: true,
 		},
 		sentry: {
 			backendDsn: '',
@@ -253,6 +286,7 @@ describe('GlobalConfig', () => {
 		},
 		logging: {
 			level: 'info',
+			format: 'text',
 			outputs: ['console'],
 			file: {
 				fileCountMax: 100,
@@ -260,6 +294,9 @@ describe('GlobalConfig', () => {
 				location: 'logs/n8n.log',
 			},
 			scopes: [],
+			cron: {
+				activeInterval: 0,
+			},
 		},
 		multiMainSetup: {
 			enabled: false,
@@ -280,12 +317,20 @@ describe('GlobalConfig', () => {
 			cert: '',
 		},
 		security: {
-			restrictFileAccessTo: '',
+			restrictFileAccessTo: '~/.n8n-files',
 			blockFileAccessToN8nFiles: true,
 			daysAbandonedWorkflow: 90,
 			contentSecurityPolicy: '{}',
+			contentSecurityPolicyReportOnly: false,
+			disableWebhookHtmlSandboxing: false,
+			disableBareRepos: true,
+			awsSystemCredentialsAccess: false,
+			enableGitNodeHooks: false,
 		},
 		executions: {
+			mode: 'regular',
+			timeout: -1,
+			maxTimeout: 3600,
 			pruneData: true,
 			pruneDataMaxAge: 336,
 			pruneDataMaxCount: 10_000,
@@ -294,6 +339,22 @@ describe('GlobalConfig', () => {
 				hardDelete: 15,
 				softDelete: 60,
 			},
+			concurrency: {
+				productionLimit: -1,
+				evaluationLimit: -1,
+			},
+			queueRecovery: {
+				interval: 180,
+				batchSize: 100,
+			},
+			recovery: {
+				maxLastExecutions: 3,
+				workflowDeactivationEnabled: false,
+			},
+			saveDataOnError: 'all',
+			saveDataOnSuccess: 'all',
+			saveExecutionProgress: false,
+			saveDataManualExecutions: true,
 		},
 		diagnostics: {
 			enabled: true,
@@ -301,24 +362,59 @@ describe('GlobalConfig', () => {
 			backendConfig: '1zPn7YoGC3ZXE9zLeTKLuQCB4F6;https://telemetry.n8n.io',
 			posthogConfig: {
 				apiKey: 'phc_4URIAm1uYfJO7j8kWSe0J8lc8IqnstRLS7Jx8NcakHo',
-				apiHost: 'https://ph.n8n.io',
+				apiHost: 'https://us.i.posthog.com',
 			},
 		},
 		aiAssistant: {
 			baseUrl: '',
 		},
+		aiBuilder: {
+			apiKey: '',
+		},
 		tags: {
 			disabled: false,
 		},
-		partialExecutions: {
-			version: 2,
+		workflowHistory: {
+			pruneTime: -1,
+		},
+		sso: {
+			justInTimeProvisioning: true,
+			redirectLoginToSso: true,
+			saml: {
+				loginEnabled: false,
+				loginLabel: '',
+			},
+			oidc: {
+				loginEnabled: false,
+			},
+			ldap: {
+				loginEnabled: false,
+				loginLabel: '',
+			},
+			provisioning: {
+				scopesProvisionInstanceRole: false,
+				scopesProvisionProjectRoles: false,
+				scopesName: 'n8n',
+				scopesInstanceRoleClaimName: 'n8n_instance_role',
+				scopesProjectsRolesClaimName: 'n8n_projects',
+			},
+		},
+		redis: {
+			prefix: 'n8n',
+		},
+		externalFrontendHooksUrls: '',
+		ai: {
+			enabled: false,
 		},
 	};
 
 	it('should use all default values when no env variables are defined', () => {
 		process.env = {};
 		const config = Container.get(GlobalConfig);
-		expect(structuredClone(config)).toEqual(defaultConfig);
+		// Makes sure the objects are structurally equal while respecting getters,
+		// which `toEqual` and `toBe` does not do.
+		expect(defaultConfig).toMatchObject(config);
+		expect(config).toMatchObject(defaultConfig);
 		expect(mockFs.readFileSync).not.toHaveBeenCalled();
 	});
 
@@ -326,11 +422,15 @@ describe('GlobalConfig', () => {
 		process.env = {
 			DB_POSTGRESDB_HOST: 'some-host',
 			DB_POSTGRESDB_USER: 'n8n',
+			DB_POSTGRESDB_IDLE_CONNECTION_TIMEOUT: '10000',
 			DB_TABLE_PREFIX: 'test_',
+			DB_PING_INTERVAL_SECONDS: '2',
 			NODES_INCLUDE: '["n8n-nodes-base.hackerNews"]',
 			DB_LOGGING_MAX_EXECUTION_TIME: '0',
 			N8N_METRICS: 'TRUE',
 			N8N_TEMPLATES_ENABLED: '0',
+			N8N_DYNAMIC_BANNERS_ENDPOINT: 'https://localhost:5678/api/banners',
+			N8N_DYNAMIC_BANNERS_ENABLED: 'false',
 		};
 		const config = Container.get(GlobalConfig);
 		expect(structuredClone(config)).toEqual({
@@ -342,10 +442,12 @@ describe('GlobalConfig', () => {
 					...defaultConfig.database.postgresdb,
 					host: 'some-host',
 					user: 'n8n',
+					idleTimeoutMs: 10_000,
 				},
 				sqlite: defaultConfig.database.sqlite,
 				tablePrefix: 'test_',
 				type: 'sqlite',
+				pingIntervalSeconds: 2,
 			},
 			endpoints: {
 				...defaultConfig.endpoints,
@@ -362,6 +464,10 @@ describe('GlobalConfig', () => {
 				...defaultConfig.templates,
 				enabled: false,
 			},
+			dynamicBanners: {
+				endpoint: 'https://localhost:5678/api/banners',
+				enabled: false,
+			},
 		});
 		expect(mockFs.readFileSync).not.toHaveBeenCalled();
 	});
@@ -374,7 +480,7 @@ describe('GlobalConfig', () => {
 		mockFs.readFileSync.calledWith(passwordFile, 'utf8').mockReturnValueOnce('password-from-file');
 
 		const config = Container.get(GlobalConfig);
-		expect(structuredClone(config)).toEqual({
+		const expected = {
 			...defaultConfig,
 			database: {
 				...defaultConfig.database,
@@ -383,7 +489,11 @@ describe('GlobalConfig', () => {
 					password: 'password-from-file',
 				},
 			},
-		});
+		};
+		// Makes sure the objects are structurally equal while respecting getters,
+		// which `toEqual` and `toBe` does not do.
+		expect(config).toMatchObject(expected);
+		expect(expected).toMatchObject(config);
 		expect(mockFs.readFileSync).toHaveBeenCalled();
 	});
 
@@ -396,5 +506,26 @@ describe('GlobalConfig', () => {
 		expect(consoleWarnMock).toHaveBeenCalledWith(
 			'Invalid number value for DB_LOGGING_MAX_EXECUTION_TIME: abcd',
 		);
+	});
+
+	describe('string unions', () => {
+		it('on invalid value, should warn and fall back to default value', () => {
+			process.env = {
+				N8N_RUNNERS_MODE: 'non-existing-mode',
+				N8N_RUNNERS_ENABLED: 'true',
+				DB_TYPE: 'postgresdb',
+			};
+
+			const globalConfig = Container.get(GlobalConfig);
+			expect(globalConfig.taskRunners.mode).toEqual('internal');
+			expect(consoleWarnMock).toHaveBeenCalledWith(
+				expect.stringContaining(
+					"Invalid value for N8N_RUNNERS_MODE - Invalid enum value. Expected 'internal' | 'external', received 'non-existing-mode'. Falling back to default value.",
+				),
+			);
+
+			expect(globalConfig.taskRunners.enabled).toEqual(true);
+			expect(globalConfig.database.type).toEqual('postgresdb');
+		});
 	});
 });

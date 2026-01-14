@@ -6,18 +6,26 @@ import { Embeddings } from '@langchain/core/embeddings';
 import type { InputValues, MemoryVariables, OutputValues } from '@langchain/core/memory';
 import type { BaseMessage } from '@langchain/core/messages';
 import { BaseRetriever } from '@langchain/core/retrievers';
-import type { Tool } from '@langchain/core/tools';
+import { BaseDocumentCompressor } from '@langchain/core/retrievers/document_compressors';
+import type { StructuredTool, Tool } from '@langchain/core/tools';
 import { VectorStore } from '@langchain/core/vectorstores';
 import { TextSplitter } from '@langchain/textsplitters';
-import type { BaseDocumentLoader } from 'langchain/dist/document_loaders/base';
+import type { BaseDocumentLoader } from '@langchain/classic/dist/document_loaders/base';
+import { OpenAIEmbeddings, AzureOpenAIEmbeddings } from '@langchain/openai';
 import type {
+	IDataObject,
 	IExecuteFunctions,
 	INodeExecutionData,
 	ISupplyDataFunctions,
 	ITaskMetadata,
 	NodeConnectionType,
 } from 'n8n-workflow';
-import { NodeOperationError, NodeConnectionTypes, parseErrorMetadata } from 'n8n-workflow';
+import {
+	NodeOperationError,
+	NodeConnectionTypes,
+	parseErrorMetadata,
+	deepCopy,
+} from 'n8n-workflow';
 
 import { logAiEvent, isToolsInstance, isBaseChatMemory, isBaseChatMessageHistory } from './helpers';
 import { N8nBinaryLoader } from './N8nBinaryLoader';
@@ -94,13 +102,17 @@ export function callMethodSync<T>(
 	}
 }
 
-export function logWrapper(
-	originalInstance:
+export function logWrapper<
+	T extends
 		| Tool
+		| StructuredTool
 		| BaseChatMemory
 		| BaseChatMessageHistory
 		| BaseRetriever
+		| BaseDocumentCompressor
 		| Embeddings
+		| OpenAIEmbeddings
+		| AzureOpenAIEmbeddings
 		| Document[]
 		| Document
 		| BaseDocumentLoader
@@ -108,8 +120,7 @@ export function logWrapper(
 		| VectorStore
 		| N8nBinaryLoader
 		| N8nJsonLoader,
-	executeFunctions: IExecuteFunctions | ISupplyDataFunctions,
-) {
+>(originalInstance: T, executeFunctions: IExecuteFunctions | ISupplyDataFunctions): T {
 	return new Proxy(originalInstance, {
 		get: (target, prop) => {
 			let connectionType: NodeConnectionType | undefined;
@@ -127,7 +138,7 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [values],
 						})) as MemoryVariables;
 
@@ -150,7 +161,7 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [input, output],
 						})) as MemoryVariables;
 
@@ -178,7 +189,7 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [],
 						})) as BaseMessage[];
 
@@ -198,7 +209,7 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [message],
 						});
 
@@ -224,7 +235,7 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [query, config],
 						})) as Array<Document<Record<string, any>>>;
 
@@ -252,7 +263,11 @@ export function logWrapper(
 			}
 
 			// ========== Embeddings ==========
-			if (originalInstance instanceof Embeddings) {
+			if (
+				originalInstance instanceof Embeddings ||
+				originalInstance instanceof OpenAIEmbeddings ||
+				originalInstance instanceof AzureOpenAIEmbeddings
+			) {
 				// Docs -> Embeddings
 				if (prop === 'embedDocuments' && 'embedDocuments' in target) {
 					return async (documents: string[]): Promise<number[][]> => {
@@ -265,7 +280,7 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [documents],
 						})) as number[][];
 
@@ -286,10 +301,36 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [query],
 						})) as number[];
 						logAiEvent(executeFunctions, 'ai-query-embedded');
+						executeFunctions.addOutputData(connectionType, index, [[{ json: { response } }]]);
+						return response;
+					};
+				}
+			}
+
+			// ========== Rerankers ==========
+			if (originalInstance instanceof BaseDocumentCompressor) {
+				if (prop === 'compressDocuments' && 'compressDocuments' in target) {
+					return async (documents: Document[], query: string): Promise<Document[]> => {
+						connectionType = NodeConnectionTypes.AiReranker;
+						const { index } = executeFunctions.addInputData(connectionType, [
+							[{ json: { query, documents } }],
+						]);
+
+						const response = (await callMethodAsync.call(target, {
+							executeFunctions,
+							connectionType,
+							currentNodeRunIndex: index,
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
+							// compressDocuments mutates the original object
+							// messing up the input data logging
+							arguments: [deepCopy(documents), query],
+						})) as Document[];
+
+						logAiEvent(executeFunctions, 'ai-document-reranked', { query });
 						executeFunctions.addOutputData(connectionType, index, [[{ json: { response } }]]);
 						return response;
 					};
@@ -311,7 +352,7 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [items],
 						})) as number[];
 
@@ -330,7 +371,7 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [item, itemIndex],
 						})) as number[];
 
@@ -356,7 +397,7 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [text],
 						})) as string[];
 
@@ -372,21 +413,31 @@ export function logWrapper(
 				if (prop === '_call' && '_call' in target) {
 					return async (query: string): Promise<string> => {
 						connectionType = NodeConnectionTypes.AiTool;
+						const inputData: IDataObject = { query };
+
+						if (target.metadata?.isFromToolkit) {
+							inputData.tool = {
+								name: target.name,
+								description: target.description,
+							};
+						}
 						const { index } = executeFunctions.addInputData(connectionType, [
-							[{ json: { query } }],
+							[{ json: inputData }],
 						]);
 
 						const response = (await callMethodAsync.call(target, {
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [query],
 						})) as string;
 
-						logAiEvent(executeFunctions, 'ai-tool-called', { query, response });
+						logAiEvent(executeFunctions, 'ai-tool-called', { ...inputData, response });
 						executeFunctions.addOutputData(connectionType, index, [[{ json: { response } }]]);
-						return response;
+
+						if (typeof response === 'string') return response;
+						return JSON.stringify(response);
 					};
 				}
 			}
@@ -397,8 +448,8 @@ export function logWrapper(
 					return async (
 						query: string,
 						k?: number,
-						filter?: BiquadFilterType | undefined,
-						_callbacks?: Callbacks | undefined,
+						filter?: BiquadFilterType,
+						_callbacks?: Callbacks,
 					): Promise<Document[]> => {
 						connectionType = NodeConnectionTypes.AiVectorStore;
 						const { index } = executeFunctions.addInputData(connectionType, [
@@ -409,7 +460,7 @@ export function logWrapper(
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [query, k, filter, _callbacks],
 						})) as Array<Document<Record<string, any>>>;
 

@@ -1,40 +1,22 @@
 <script setup lang="ts">
-import Markdown from 'markdown-it';
-import markdownLink from 'markdown-it-link-attributes';
-import { computed, ref } from 'vue';
+import { computed, nextTick, onUnmounted, ref, useCssModule, watch } from 'vue';
 
+import MessageWrapper from './messages/MessageWrapper.vue';
 import { useI18n } from '../../composables/useI18n';
-import type { ChatUI } from '../../types/assistant';
-import AssistantAvatar from '../AskAssistantAvatar/AssistantAvatar.vue';
+import type { ChatUI, RatingFeedback, WorkflowSuggestion } from '../../types/assistant';
+import { isTaskAbortedMessage, isToolMessage } from '../../types/assistant';
 import AssistantIcon from '../AskAssistantIcon/AssistantIcon.vue';
 import AssistantLoadingMessage from '../AskAssistantLoadingMessage/AssistantLoadingMessage.vue';
 import AssistantText from '../AskAssistantText/AssistantText.vue';
-import BetaTag from '../BetaTag/BetaTag.vue';
-import BlinkingCursor from '../BlinkingCursor/BlinkingCursor.vue';
-import CodeDiff from '../CodeDiff/CodeDiff.vue';
 import InlineAskAssistantButton from '../InlineAskAssistantButton/InlineAskAssistantButton.vue';
+import N8nButton from '../N8nButton';
+import N8nIcon from '../N8nIcon';
+import N8nPromptInput from '../N8nPromptInput';
+import N8nPromptInputSuggestions from '../N8nPromptInputSuggestions';
+import N8nScrollArea from '../N8nScrollArea/N8nScrollArea.vue';
+import { getSupportedMessageComponent } from './messages/helpers';
 
 const { t } = useI18n();
-
-const md = new Markdown({
-	breaks: true,
-});
-md.use(markdownLink, {
-	attrs: {
-		target: '_blank',
-		rel: 'noopener',
-	},
-});
-// Wrap tables in div
-md.renderer.rules.table_open = function () {
-	return '<div class="table-wrapper"><table>';
-};
-
-md.renderer.rules.table_close = function () {
-	return '</table></div>';
-};
-
-const MAX_CHAT_INPUT_HEIGHT = 100;
 
 interface Props {
 	user?: {
@@ -43,43 +25,185 @@ interface Props {
 	};
 	messages?: ChatUI.AssistantMessage[];
 	streaming?: boolean;
+	disabled?: boolean;
 	loadingMessage?: string;
 	sessionId?: string;
+	inputPlaceholder?: string;
+	scrollOnNewMessage?: boolean;
+	showStop?: boolean;
+	creditsQuota?: number;
+	creditsRemaining?: number;
+	showAskOwnerTooltip?: boolean;
+	maxCharacterLength?: number;
+	suggestions?: WorkflowSuggestion[];
 }
 
 const emit = defineEmits<{
 	close: [];
+	stop: [];
 	message: [string, string?, boolean?];
 	codeReplace: [number];
 	codeUndo: [number];
+	feedback: [RatingFeedback];
+	'upgrade-click': [];
 }>();
 
 const onClose = () => emit('close');
 
-const props = defineProps<Props>();
+const props = withDefaults(defineProps<Props>(), {
+	user: () => ({
+		firstName: '',
+		lastName: '',
+	}),
+	messages: () => [],
+	loadingMessage: undefined,
+	sessionId: undefined,
+	scrollOnNewMessage: false,
+	maxCharacterLength: undefined,
+	inputPlaceholder: undefined,
+});
+
+function normalizeMessages(messages: ChatUI.AssistantMessage[]): ChatUI.AssistantMessage[] {
+	return messages.map((msg, index) => ({
+		...msg,
+		id: msg.id || `msg-${index}`,
+		read: msg.read ?? true,
+	}));
+}
+
+// filter out these messages so that tool collapsing works correctly
+function filterOutHiddenMessages(messages: ChatUI.AssistantMessage[]): ChatUI.AssistantMessage[] {
+	return messages.filter(
+		(message) => Boolean(getSupportedMessageComponent(message.type)) || message.type === 'custom',
+	);
+}
+
+function collapseToolMessages(messages: ChatUI.AssistantMessage[]): ChatUI.AssistantMessage[] {
+	const result: ChatUI.AssistantMessage[] = [];
+	let i = 0;
+
+	while (i < messages.length) {
+		const currentMsg = messages[i];
+
+		// If it's not a tool message, add it as-is and continue
+		if (!isToolMessage(currentMsg)) {
+			result.push(currentMsg);
+			i++;
+			continue;
+		}
+
+		// Collect consecutive tool messages with the same toolName
+		const toolMessagesGroup = [currentMsg];
+		let j = i + 1;
+
+		while (j < messages.length) {
+			const nextMsg = messages[j];
+			if (isToolMessage(nextMsg) && nextMsg.toolName === currentMsg.toolName) {
+				toolMessagesGroup.push(nextMsg);
+				j++;
+			} else {
+				break;
+			}
+		}
+
+		// If we have multiple tool messages with the same toolName, collapse them
+		if (toolMessagesGroup.length > 1) {
+			// Determine the status to show based on priority rules
+			const lastMessage = toolMessagesGroup[toolMessagesGroup.length - 1];
+			let titleSource = lastMessage;
+
+			// Check if we have running messages - if so, show the last running one and use its titles
+			const runningMessages = toolMessagesGroup.filter((msg) => msg.status === 'running');
+			const errorMessage = toolMessagesGroup.find((msg) => msg.status === 'error');
+			if (runningMessages.length > 0) {
+				const lastRunning = runningMessages[runningMessages.length - 1];
+				titleSource = lastRunning;
+			} else if (errorMessage) {
+				titleSource = errorMessage;
+			}
+
+			// Combine all updates from all messages in the group
+			const combinedUpdates = toolMessagesGroup.flatMap((msg) => msg.updates || []);
+
+			// Create collapsed message using last message as base, but with titles from titleSource
+			const collapsedMessage: ChatUI.ToolMessage = {
+				...lastMessage,
+				displayTitle: titleSource.displayTitle,
+				customDisplayTitle:
+					titleSource.status === 'running' ? titleSource.customDisplayTitle : undefined,
+				status: titleSource.status,
+				updates: combinedUpdates,
+			};
+
+			result.push(collapsedMessage);
+		} else {
+			// Single tool message, add as-is
+			result.push(currentMsg);
+		}
+
+		i = j;
+	}
+
+	return result;
+}
+
+// Ensure all messages have required id and read properties, and collapse tool messages
+const normalizedMessages = computed(() => {
+	const normalized = normalizeMessages(props.messages);
+	return collapseToolMessages(filterOutHiddenMessages(normalized));
+});
+
+// Get quickReplies from the last message in the original messages (before filtering)
+const lastMessageQuickReplies = computed(() => {
+	if (!props.messages?.length || props.streaming) return [];
+
+	const lastMessage = props.messages[props.messages.length - 1];
+	return 'quickReplies' in lastMessage && lastMessage.quickReplies?.length
+		? lastMessage.quickReplies
+		: [];
+});
 
 const textInputValue = ref<string>('');
+const promptInputRef = ref<InstanceType<typeof N8nPromptInput>>();
+const scrollAreaRef = ref<InstanceType<typeof N8nScrollArea>>();
 
-const chatInput = ref<HTMLTextAreaElement | null>(null);
+const messagesRef = ref<HTMLDivElement | null>(null);
+const inputWrapperRef = ref<HTMLDivElement | null>(null);
 
 const sessionEnded = computed(() => {
 	return isEndOfSessionEvent(props.messages?.[props.messages.length - 1]);
 });
 
 const sendDisabled = computed(() => {
-	return !textInputValue.value || props.streaming || sessionEnded.value;
+	return !textInputValue.value || props.streaming || sessionEnded.value || props.disabled;
 });
 
 const showPlaceholder = computed(() => {
 	return !props.messages?.length && !props.loadingMessage && !props.sessionId;
 });
 
-const isClipboardSupported = computed(() => {
-	return navigator.clipboard?.writeText;
+const showSuggestions = computed(() => {
+	return showPlaceholder.value && props.suggestions && props.suggestions.length > 0;
+});
+
+const showBottomInput = computed(() => {
+	// Hide bottom input when showing suggestions (blank state with suggestions)
+	return !showSuggestions.value;
 });
 
 function isEndOfSessionEvent(event?: ChatUI.AssistantMessage) {
 	return event?.type === 'event' && event?.eventName === 'end-session';
+}
+
+async function onSuggestionClick(suggestion: WorkflowSuggestion) {
+	// Populate the input field with the suggestion so user can edit before submitting
+	textInputValue.value = suggestion.prompt;
+	// Wait for the input to update its height before focusing
+	await nextTick();
+	// Wait one more frame to ensure DOM is fully updated
+	await new Promise(requestAnimationFrame);
+	// Focus the input so user can edit it
+	promptInputRef.value?.focusInput();
 }
 
 function onQuickReply(opt: ChatUI.QuickReply) {
@@ -87,38 +211,92 @@ function onQuickReply(opt: ChatUI.QuickReply) {
 }
 
 function onSendMessage() {
-	if (sendDisabled.value) return;
 	emit('message', textInputValue.value);
 	textInputValue.value = '';
-	if (chatInput.value) {
-		chatInput.value.style.height = 'auto';
+}
+
+function onRateMessage(feedback: RatingFeedback) {
+	emit('feedback', feedback);
+}
+
+function scrollToBottom() {
+	scrollAreaRef.value?.scrollToBottom({ smooth: true });
+}
+
+function scrollToBottomImmediate() {
+	scrollAreaRef.value?.scrollToBottom({ smooth: false });
+}
+
+watch(sendDisabled, () => {
+	promptInputRef.value?.focusInput();
+});
+
+watch(
+	() => props.messages,
+	async (messages) => {
+		// Check if the last message is user and scroll to bottom of the chat
+		if (props.scrollOnNewMessage && messages.length > 0) {
+			// Wait for DOM updates before scrolling
+			await nextTick();
+			scrollToBottom();
+		}
+	},
+	{ immediate: true, deep: true },
+);
+
+// Setup initial scroll to bottom
+let isMounted = true;
+
+// Watch for when the input becomes available and set up observers
+watch(
+	showBottomInput,
+	async (isShown) => {
+		if (!isShown) {
+			return;
+		}
+		// Wait for the input to be mounted in the DOM
+		await nextTick();
+
+		if (!isMounted || !inputWrapperRef.value || !scrollAreaRef.value) {
+			return;
+		}
+
+		// Start at bottom
+		scrollToBottomImmediate();
+	},
+	{ immediate: true },
+);
+
+onUnmounted(() => {
+	isMounted = false;
+});
+
+function getMessageStyles(message: ChatUI.AssistantMessage, messageCount: number) {
+	const $style = useCssModule();
+	return {
+		[$style.firstToolMessage]:
+			message.type === 'tool' &&
+			(messageCount === 0 || normalizedMessages.value[messageCount - 1].type !== 'tool'),
+		[$style.lastToolMessage]:
+			message.type === 'tool' &&
+			((messageCount === normalizedMessages.value.length - 1 && !props.loadingMessage) ||
+				(messageCount < normalizedMessages.value.length - 1 &&
+					normalizedMessages.value[messageCount + 1]?.type !== 'tool')),
+	};
+}
+
+function getMessageColor(message: ChatUI.AssistantMessage): string | undefined {
+	if (isTaskAbortedMessage(message)) {
+		return 'var(--color--text)';
 	}
+	return undefined;
 }
 
-function renderMarkdown(content: string) {
-	try {
-		return md.render(content);
-	} catch (e) {
-		console.error(`Error parsing markdown content ${content}`);
-		return `<p>${t('assistantChat.errorParsingMarkdown')}</p>`;
-	}
-}
-
-function growInput() {
-	if (!chatInput.value) return;
-	chatInput.value.style.height = 'auto';
-	const scrollHeight = chatInput.value.scrollHeight;
-	chatInput.value.style.height = `${Math.min(scrollHeight, MAX_CHAT_INPUT_HEIGHT)}px`;
-}
-
-async function onCopyButtonClick(content: string, e: MouseEvent) {
-	const button = e.target as HTMLButtonElement;
-	await navigator.clipboard.writeText(content);
-	button.innerText = t('assistantChat.copied');
-	setTimeout(() => {
-		button.innerText = t('assistantChat.copy');
-	}, 2000);
-}
+defineExpose({
+	focusInput: () => {
+		promptInputRef.value?.focusInput();
+	},
+});
 </script>
 
 <template>
@@ -126,224 +304,171 @@ async function onCopyButtonClick(content: string, e: MouseEvent) {
 		<div :class="$style.header">
 			<div :class="$style.chatTitle">
 				<div :class="$style.headerText">
-					<AssistantIcon size="large" />
-					<AssistantText size="large" :text="t('assistantChat.aiAssistantLabel')" />
+					<div :class="$style.assistantTitle">
+						<AssistantIcon size="large" />
+						<AssistantText size="large" :text="t('assistantChat.aiAssistantLabel')" />
+					</div>
+					<span :class="$style.betaTag">{{ t('assistantChat.aiAssistantBetaLabel') }}</span>
 				</div>
-				<BetaTag />
+				<slot name="header" />
 			</div>
 			<div :class="$style.back" data-test-id="close-chat-button" @click="onClose">
-				<n8n-icon icon="arrow-right" color="text-base" />
+				<N8nIcon icon="arrow-right" color="text-base" />
 			</div>
 		</div>
 		<div :class="$style.body">
-			<div v-if="messages?.length || loadingMessage" :class="$style.messages">
-				<div v-if="messages?.length">
-					<div
-						v-for="(message, i) in messages"
-						:key="i"
-						:class="$style.message"
-						:data-test-id="
-							message.role === 'assistant' ? 'chat-message-assistant' : 'chat-message-user'
-						"
-					>
-						<div
-							v-if="
-								!isEndOfSessionEvent(message) && (i === 0 || message.role !== messages[i - 1].role)
-							"
-							:class="{ [$style.roleName]: true, [$style.userSection]: i > 0 }"
-						>
-							<AssistantAvatar v-if="message.role === 'assistant'" />
-							<n8n-avatar
-								v-else
-								:first-name="user?.firstName"
-								:last-name="user?.lastName"
-								size="xsmall"
-							/>
-
-							<span v-if="message.role === 'assistant'">{{
-								t('assistantChat.aiAssistantName')
-							}}</span>
-							<span v-else>{{ t('assistantChat.you') }}</span>
-						</div>
-						<div v-if="message.type === 'block'">
-							<div :class="$style.block">
-								<div :class="$style.blockTitle">
-									{{ message.title }}
-									<BlinkingCursor
-										v-if="streaming && i === messages?.length - 1 && !message.content"
-									/>
-								</div>
-								<div :class="$style.blockBody">
-									<span
-										v-n8n-html="renderMarkdown(message.content)"
-										:class="$style['rendered-content']"
-									></span>
-									<BlinkingCursor
-										v-if="
-											streaming && i === messages?.length - 1 && message.title && message.content
-										"
-									/>
-								</div>
-							</div>
-						</div>
-						<div v-else-if="message.type === 'text'" :class="$style.textMessage">
-							<span
-								v-if="message.role === 'user'"
-								v-n8n-html="renderMarkdown(message.content)"
-								:class="$style['rendered-content']"
-							></span>
-							<div
-								v-else
-								v-n8n-html="renderMarkdown(message.content)"
-								:class="[$style.assistantText, $style['rendered-content']]"
-							></div>
-							<div
-								v-if="message?.codeSnippet"
-								:class="$style['code-snippet']"
-								data-test-id="assistant-code-snippet"
+			<div v-if="normalizedMessages?.length || loadingMessage" :class="$style.messages">
+				<N8nScrollArea
+					ref="scrollAreaRef"
+					type="hover"
+					:enable-vertical-scroll="true"
+					:enable-horizontal-scroll="false"
+				>
+					<div ref="messagesRef" :class="$style.messagesContent">
+						<div v-if="normalizedMessages?.length">
+							<data
+								v-for="(message, i) in normalizedMessages"
+								:key="message.id"
+								:data-test-id="
+									message.role === 'assistant' ? 'chat-message-assistant' : 'chat-message-user'
+								"
 							>
-								<header v-if="isClipboardSupported">
-									<n8n-button
-										type="tertiary"
-										text="true"
-										size="mini"
-										data-test-id="assistant-copy-snippet-button"
-										@click="onCopyButtonClick(message.codeSnippet, $event)"
-									>
-										{{ t('assistantChat.copy') }}
-									</n8n-button>
-								</header>
-								<div
-									v-n8n-html="renderMarkdown(message.codeSnippet).trim()"
-									data-test-id="assistant-code-snippet-content"
-									:class="[$style['snippet-content'], $style['rendered-content']]"
-								></div>
-							</div>
-							<BlinkingCursor
-								v-if="streaming && i === messages?.length - 1 && message.role === 'assistant'"
-							/>
-						</div>
-						<div
-							v-else-if="message.type === 'error'"
-							:class="$style.error"
-							data-test-id="chat-message-system"
-						>
-							<span>⚠️ {{ message.content }}</span>
-							<n8n-button
-								v-if="message.retry"
-								type="secondary"
-								size="mini"
-								:class="$style.retryButton"
-								data-test-id="error-retry-button"
-								@click="() => message.retry?.()"
-							>
-								{{ t('generic.retry') }}
-							</n8n-button>
-						</div>
-						<div v-else-if="message.type === 'code-diff'">
-							<CodeDiff
-								:title="message.description"
-								:content="message.codeDiff"
-								:replacing="message.replacing"
-								:replaced="message.replaced"
-								:error="message.error"
-								:streaming="streaming && i === messages?.length - 1"
-								@replace="() => emit('codeReplace', i)"
-								@undo="() => emit('codeUndo', i)"
-							/>
-						</div>
-						<div
-							v-else-if="isEndOfSessionEvent(message)"
-							:class="$style.endOfSessionText"
-							data-test-id="chat-message-system"
-						>
-							<span>
-								{{ t('assistantChat.sessionEndMessage.1') }}
-							</span>
-							<InlineAskAssistantButton size="small" :static="true" />
-							<span>
-								{{ t('assistantChat.sessionEndMessage.2') }}
-							</span>
-						</div>
-
-						<div
-							v-if="
-								!streaming &&
-								'quickReplies' in message &&
-								message.quickReplies?.length &&
-								i === messages?.length - 1
-							"
-							:class="$style.quickReplies"
-						>
-							<div :class="$style.quickRepliesTitle">
-								{{ t('assistantChat.quickRepliesTitle') }}
-							</div>
-							<div v-for="opt in message.quickReplies" :key="opt.type" data-test-id="quick-replies">
-								<n8n-button
-									v-if="opt.text"
-									type="secondary"
-									size="mini"
-									@click="() => onQuickReply(opt)"
+								<MessageWrapper
+									:message="message"
+									:is-first-of-role="i === 0 || message.role !== normalizedMessages[i - 1].role"
+									:user="user"
+									:streaming="streaming"
+									:is-last-message="i === normalizedMessages.length - 1"
+									:class="getMessageStyles(message, i)"
+									:color="getMessageColor(message)"
+									@code-replace="() => emit('codeReplace', i)"
+									@code-undo="() => emit('codeUndo', i)"
+									@feedback="onRateMessage"
 								>
-									{{ opt.text }}
-								</n8n-button>
-							</div>
+									<template v-if="$slots['custom-message']" #custom-message="customMessageProps">
+										<slot name="custom-message" v-bind="customMessageProps" />
+									</template>
+								</MessageWrapper>
+
+								<div
+									v-if="lastMessageQuickReplies.length && i === normalizedMessages.length - 1"
+									:class="$style.quickReplies"
+								>
+									<div :class="$style.quickRepliesTitle">
+										{{ t('assistantChat.quickRepliesTitle') }}
+									</div>
+									<div
+										v-for="opt in lastMessageQuickReplies"
+										:key="opt.type"
+										data-test-id="quick-replies"
+									>
+										<N8nButton
+											v-if="opt.text"
+											type="secondary"
+											size="mini"
+											@click="() => onQuickReply(opt)"
+										>
+											{{ opt.text }}
+										</N8nButton>
+									</div>
+								</div>
+							</data>
+							<slot name="messagesFooter" />
+						</div>
+						<div
+							v-if="loadingMessage"
+							:class="{
+								[$style.message]: true,
+								[$style.loading]: normalizedMessages?.length,
+								[$style.firstToolMessage]:
+									normalizedMessages?.length === 0 ||
+									normalizedMessages[normalizedMessages.length - 1].type !== 'tool',
+								[$style.lastToolMessage]: true,
+							}"
+						>
+							<AssistantLoadingMessage :message="loadingMessage" />
 						</div>
 					</div>
-				</div>
-				<div
-					v-if="loadingMessage"
-					:class="{ [$style.message]: true, [$style.loading]: messages?.length }"
-				>
-					<AssistantLoadingMessage :message="loadingMessage" />
-				</div>
+				</N8nScrollArea>
 			</div>
 			<div
 				v-else-if="showPlaceholder"
 				:class="$style.placeholder"
 				data-test-id="placeholder-message"
 			>
-				<div :class="$style.greeting">Hi {{ user?.firstName }} 👋</div>
-				<div :class="$style.info">
-					<p>
-						{{ t('assistantChat.placeholder.1') }}
-					</p>
-					<p>
-						{{ t('assistantChat.placeholder.2') }}
-						<InlineAskAssistantButton size="small" :static="true" />
-						{{ t('assistantChat.placeholder.3') }}
-					</p>
-					<p>
-						{{ t('assistantChat.placeholder.4') }}
-					</p>
+				<div v-if="showSuggestions" :class="$style.suggestionsContainer">
+					<N8nPromptInputSuggestions
+						:suggestions="suggestions"
+						:disabled="disabled"
+						:streaming="streaming"
+						@suggestion-click="onSuggestionClick"
+					>
+						<template #prompt-input>
+							<N8nPromptInput
+								ref="promptInputRef"
+								v-model="textInputValue"
+								:placeholder="t('assistantChat.blankStateInputPlaceholder')"
+								:disabled="disabled"
+								:streaming="streaming"
+								:credits-quota="creditsQuota"
+								:credits-remaining="creditsRemaining"
+								:show-ask-owner-tooltip="showAskOwnerTooltip"
+								:max-length="maxCharacterLength"
+								:min-lines="2"
+								data-test-id="chat-suggestions-input"
+								@upgrade-click="emit('upgrade-click')"
+								@submit="onSendMessage"
+								@stop="emit('stop')"
+							/>
+						</template>
+					</N8nPromptInputSuggestions>
 				</div>
+				<div v-else-if="$slots.placeholder" :class="$style.info">
+					<slot name="placeholder" />
+				</div>
+				<template v-else>
+					<div :class="$style.greeting">Hi {{ user?.firstName }} 👋</div>
+					<div :class="$style.info">
+						<p>
+							{{ t('assistantChat.placeholder.1') }}
+						</p>
+						<p>
+							{{ t('assistantChat.placeholder.2') }}
+							<InlineAskAssistantButton size="small" :static="true" />
+							{{ t('assistantChat.placeholder.3') }}
+						</p>
+						<p>
+							{{ t('assistantChat.placeholder.4') }}
+						</p>
+					</div>
+				</template>
 			</div>
 		</div>
 		<div
+			v-if="showBottomInput"
+			ref="inputWrapperRef"
 			:class="{ [$style.inputWrapper]: true, [$style.disabledInput]: sessionEnded }"
 			data-test-id="chat-input-wrapper"
 		>
-			<textarea
-				ref="chatInput"
+			<div v-if="$slots.inputPlaceholder" :class="$style.inputPlaceholder">
+				<slot name="inputPlaceholder" />
+			</div>
+			<N8nPromptInput
+				v-else
+				ref="promptInputRef"
 				v-model="textInputValue"
-				class="ignore-key-press-node-creator ignore-key-press-canvas"
-				:disabled="sessionEnded"
-				:placeholder="t('assistantChat.inputPlaceholder')"
-				rows="1"
-				wrap="hard"
+				:placeholder="inputPlaceholder || t('assistantChat.inputPlaceholder')"
+				:disabled="sessionEnded || disabled"
+				:streaming="streaming"
+				:credits-quota="creditsQuota"
+				:credits-remaining="creditsRemaining"
+				:show-ask-owner-tooltip="showAskOwnerTooltip"
+				:max-length="maxCharacterLength"
+				:refocus-after-send="true"
 				data-test-id="chat-input"
-				@keydown.enter.exact.prevent="onSendMessage"
-				@input.prevent="growInput"
-				@keydown.stop
-			/>
-			<n8n-icon-button
-				:class="{ [$style.sendButton]: true }"
-				icon="paper-plane"
-				type="text"
-				size="large"
-				data-test-id="send-message-button"
-				:disabled="sendDisabled"
-				@click="onSendMessage"
+				@upgrade-click="emit('upgrade-click')"
+				@submit="onSendMessage"
+				@stop="emit('stop')"
 			/>
 		</div>
 	</div>
@@ -355,18 +480,14 @@ async function onCopyButtonClick(content: string, e: MouseEvent) {
 	position: relative;
 	display: grid;
 	grid-template-rows: auto 1fr auto;
-}
-
-p {
-	line-height: var(--font-line-height-xloose);
-	margin: var(--spacing-2xs) 0;
+	background-color: var(--color--background--light-2);
 }
 
 .header {
 	height: 65px; // same as header height in editor
-	padding: 0 var(--spacing-l);
-	background-color: var(--color-background-xlight);
-	border: var(--border-base);
+	padding: 0 var(--spacing--lg);
+	background-color: var(--color--background--light-3);
+	border: var(--border);
 	border-top: 0;
 	display: flex;
 
@@ -380,10 +501,17 @@ p {
 	}
 }
 
+.betaTag {
+	color: var(--color--text);
+	font-size: var(--font-size--2xs);
+	font-weight: var(--font-weight--bold);
+}
+
 .body {
-	background-color: var(--color-background-light);
-	border: var(--border-base);
+	background-color: var(--color--background--light-2);
+	border: var(--border);
 	border-top: 0;
+	border-bottom: 0;
 	position: relative;
 
 	pre,
@@ -393,7 +521,20 @@ p {
 }
 
 .placeholder {
-	padding: var(--spacing-s);
+	padding: var(--spacing--sm);
+	height: 100%;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+}
+
+.suggestionsContainer {
+	display: flex;
+	justify-content: center;
+	align-items: center;
+	width: 100%;
+	height: 100%;
+	padding: 0;
 }
 
 .messages {
@@ -402,59 +543,49 @@ p {
 	left: 0;
 	width: 100%;
 	height: 100%;
-	padding: var(--spacing-xs);
-	overflow-y: auto;
+}
 
-	& + & {
-		padding-top: 0;
-	}
+.messagesContent {
+	padding: var(--spacing--xs);
+	padding-bottom: var(--spacing--xl); // Extra padding for fade area
 }
 
 .message {
-	margin-bottom: var(--spacing-xs);
-	font-size: var(--font-size-2xs);
-	line-height: var(--font-line-height-xloose);
-
-	&.loading {
-		margin-top: var(--spacing-m);
-	}
+	margin-bottom: var(--spacing--sm);
+	font-size: var(--font-size--2xs);
+	line-height: var(--line-height--xl);
 }
 
-.roleName {
-	display: flex;
-	align-items: center;
-	margin-bottom: var(--spacing-3xs);
-
-	font-weight: var(--font-weight-bold);
-	font-size: var(--font-size-2xs);
-
-	> * {
-		margin-right: var(--spacing-3xs);
-	}
+.firstToolMessage {
+	margin-top: var(--spacing--md);
 }
 
-.userSection {
-	margin-top: var(--spacing-l);
+.lastToolMessage {
+	margin-bottom: var(--spacing--lg);
 }
 
 .chatTitle {
 	display: flex;
-	gap: var(--spacing-3xs);
+	gap: var(--spacing--xs);
 }
 
 .headerText {
-	gap: var(--spacing-xs);
+	gap: var(--spacing--3xs);
+}
+
+.assistantTitle {
+	gap: var(--spacing--2xs);
 }
 
 .greeting {
-	color: var(--color-text-dark);
-	font-size: var(--font-size-m);
-	margin-bottom: var(--spacing-s);
+	color: var(--color--text--shade-1);
+	font-size: var(--font-size--md);
+	margin-bottom: var(--spacing--sm);
 }
 
 .info {
-	font-size: var(--font-size-s);
-	color: var(--color-text-base);
+	font-size: var(--font-size--sm);
+	color: var(--color--text);
 
 	button {
 		display: inline-flex;
@@ -466,199 +597,37 @@ p {
 }
 
 .quickReplies {
-	margin-top: var(--spacing-s);
+	margin-top: var(--spacing--sm);
+
 	> * {
-		margin-bottom: var(--spacing-3xs);
+		margin-bottom: var(--spacing--3xs);
 	}
 }
 
 .quickRepliesTitle {
-	font-size: var(--font-size-3xs);
-	color: var(--color-text-base);
-}
-
-.textMessage {
-	display: flex;
-	flex-direction: column;
-	gap: var(--spacing-xs);
-	font-size: var(--font-size-2xs);
-	word-break: break-word;
-}
-
-code[class^='language-'] {
-	display: block;
-	padding: var(--spacing-4xs);
-}
-
-.code-snippet {
-	position: relative;
-	border: var(--border-base);
-	background-color: var(--color-foreground-xlight);
-	border-radius: var(--border-radius-base);
-	font-family: var(--font-family-monospace);
-	font-size: var(--font-size-3xs);
-	max-height: 218px; // 12 lines
-	overflow: auto;
-	margin: var(--spacing-4s) 0;
-
-	header {
-		display: flex;
-		justify-content: flex-end;
-		padding: var(--spacing-4xs);
-		border-bottom: var(--border-base);
-
-		button:active,
-		button:focus {
-			outline: none !important;
-		}
-	}
-
-	.snippet-content {
-		padding: var(--spacing-2xs);
-	}
-
-	pre {
-		white-space-collapse: collapse;
-	}
-
-	code {
-		background-color: transparent;
-		font-size: var(--font-size-3xs);
-	}
-}
-
-.block {
-	font-size: var(--font-size-2xs);
-	background-color: var(--color-foreground-xlight);
-	border: var(--border-base);
-	border-radius: var(--border-radius-base);
-	word-break: break-word;
-
-	li {
-		margin-left: var(--spacing-xs);
-	}
-}
-
-.blockTitle {
-	border-bottom: var(--border-base);
-	padding: var(--spacing-2xs);
-	font-weight: var(--font-weight-bold);
-}
-
-.blockBody {
-	padding: var(--spacing-xs);
+	font-size: var(--font-size--3xs);
+	color: var(--color--text);
 }
 
 .inputWrapper {
-	display: flex;
-	background-color: var(--color-foreground-xlight);
-	border: var(--border-base);
+	padding: var(--spacing--4xs) var(--spacing--2xs) var(--spacing--xs);
+	background-color: transparent;
 	width: 100%;
-	border-top: 0;
+	position: relative;
+	border-left: var(--border);
+	border-right: var(--border);
 
-	textarea {
-		border: none;
-		background-color: transparent;
-		width: 100%;
-		font-size: var(--spacing-xs);
-		padding: var(--spacing-xs);
-		outline: none;
-		color: var(--color-text-dark);
-		resize: none;
-		font-family: inherit;
-	}
-}
-
-.sendButton {
-	color: var(--color-text-base) !important;
-
-	&[disabled] {
-		color: var(--color-text-light) !important;
-	}
-}
-
-.error {
-	color: var(--color-danger);
-	display: flex;
-	flex-direction: column;
-	align-items: start;
-}
-
-.retryButton {
-	margin-top: var(--spacing-3xs);
-}
-
-.assistantText {
-	display: inline-flex;
-	flex-direction: column;
-}
-
-.rendered-content {
-	p {
-		margin: 0;
-		margin: var(--spacing-4xs) 0;
-	}
-
-	h1,
-	h2,
-	h3 {
-		font-weight: var(--font-weight-bold);
-		font-size: var(--font-size-xs);
-		margin: var(--spacing-xs) 0 var(--spacing-4xs);
-	}
-
-	h4,
-	h5,
-	h6 {
-		font-weight: var(--font-weight-bold);
-		font-size: var(--font-size-2xs);
-	}
-
-	ul,
-	ol {
-		margin: var(--spacing-4xs) 0 var(--spacing-4xs) var(--spacing-l);
-
-		ul,
-		ol {
-			margin-left: var(--spacing-xs);
-			margin-top: var(--spacing-4xs);
-		}
-	}
-
-	:global(.table-wrapper) {
-		overflow-x: auto;
-	}
-
-	table {
-		margin: var(--spacing-4xs) 0;
-
-		th {
-			white-space: nowrap;
-			min-width: 120px;
-			width: auto;
-		}
-
-		th,
-		td {
-			border: var(--border-base);
-			padding: var(--spacing-4xs);
-		}
-	}
-}
-
-.endOfSessionText {
-	margin-top: var(--spacing-l);
-	padding-top: var(--spacing-3xs);
-	border-top: var(--border-base);
-	color: var(--color-text-base);
-
-	> button,
-	> span {
-		margin-right: var(--spacing-3xs);
-	}
-
-	button {
-		display: inline-flex;
+	// Add a gradient fade from the chat to the input
+	&::before {
+		content: '';
+		position: absolute;
+		top: calc(-1 * var(--spacing--md));
+		left: 0;
+		right: var(--spacing--xs);
+		height: var(--spacing--md);
+		background: linear-gradient(to bottom, transparent 0%, var(--color--background--light-2) 100%);
+		pointer-events: none;
+		z-index: 1;
 	}
 }
 
@@ -668,5 +637,9 @@ code[class^='language-'] {
 	* {
 		cursor: not-allowed;
 	}
+}
+
+.inputPlaceholder {
+	width: 100%;
 }
 </style>

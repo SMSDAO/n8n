@@ -1,4 +1,4 @@
-import type { IDataObject, IExecuteFunctions, INode } from 'n8n-workflow';
+import type { IDataObject, INode } from 'n8n-workflow';
 import { NodeOperationError } from 'n8n-workflow';
 import pgPromise from 'pg-promise';
 
@@ -18,7 +18,6 @@ import {
 	convertValuesToJsonWithPgp,
 	hasJsonDataTypeInSchema,
 	evaluateExpression,
-	addExecutionHints,
 } from '../../v2/helpers/utils';
 
 const node: INode = {
@@ -429,36 +428,47 @@ describe('Test PostgresV2, hasJsonDataType', () => {
 });
 
 describe('Test PostgresV2, convertValuesToJsonWithPgp', () => {
-	it('should use pgp to properly convert values to JSON', () => {
-		const pgp = pgPromise();
-		const pgpJsonSpy = jest.spyOn(pgp.as, 'json');
+	const pgp = pgPromise();
+	const pgpJsonSpy = jest.spyOn(pgp.as, 'json');
+	const schema: ColumnInfo[] = [
+		{ column_name: 'data', data_type: 'json', is_nullable: 'YES' },
+		{ column_name: 'id', data_type: 'integer', is_nullable: 'NO' },
+	];
 
-		const schema: ColumnInfo[] = [
-			{ column_name: 'data', data_type: 'json', is_nullable: 'YES' },
-			{ column_name: 'id', data_type: 'integer', is_nullable: 'NO' },
-		];
-		const values = [
-			{
-				value: { data: [], id: 1 },
-				expected: { data: '[]', id: 1 },
-			},
-			{
-				value: { data: [0], id: 1 },
-				expected: { data: '[0]', id: 1 },
-			},
-			{
-				value: { data: { key: 2 }, id: 1 },
-				expected: { data: '{"key":2}', id: 1 },
-			},
-		];
+	beforeEach(() => {
+		pgpJsonSpy.mockClear();
+	});
 
-		values.forEach((value) => {
-			const data = value.value.data;
-
-			expect(convertValuesToJsonWithPgp(pgp, schema, value.value)).toEqual(value.expected);
-			expect(value.value).toEqual(value.expected);
+	it.each([
+		{
+			value: { data: [], id: 1 },
+			expected: { data: '[]', id: 1 },
+		},
+		{
+			value: { data: [0], id: 1 },
+			expected: { data: '[0]', id: 1 },
+		},
+		{
+			value: { data: { key: 2 }, id: 1 },
+			expected: { data: '{"key":2}', id: 1 },
+		},
+		{
+			value: { data: null, id: 1 },
+			expected: { data: null, id: 1 },
+			shouldSkipPgp: true,
+		},
+		{
+			value: { data: undefined, id: 1 },
+			expected: { data: undefined, id: 1 },
+			shouldSkipPgp: true,
+		},
+	])('should convert $value.data to json correctly', ({ value, expected, shouldSkipPgp }) => {
+		const data = value.data;
+		expect(convertValuesToJsonWithPgp(pgp, schema, value)).toEqual(expected);
+		expect(value).toEqual(expected);
+		if (!shouldSkipPgp) {
 			expect(pgpJsonSpy).toHaveBeenCalledWith(data, true);
-		});
+		}
 	});
 });
 
@@ -525,9 +535,9 @@ describe('Test PostgresV2, convertArraysToPostgresFormat', () => {
 			},
 		];
 
-		convertArraysToPostgresFormat(item, schema, node, 0);
+		const result = convertArraysToPostgresFormat(item, schema, node, 0);
 
-		expect(item).toEqual({
+		expect(result).toEqual({
 			jsonb_array: '{"{\\"key\\":\\"value44\\"}"}',
 			json_array: '{"{\\"key\\":\\"value54\\"}"}',
 			int_array: '{1,2,5}',
@@ -535,39 +545,29 @@ describe('Test PostgresV2, convertArraysToPostgresFormat', () => {
 			bool_array: '{"true","false"}',
 		});
 	});
-});
 
-describe('Test PostgresV2, addExecutionHints', () => {
-	it('should add batching insert hint to executeQuery operation', () => {
-		const context = {
-			getNodeParameter: (parameterName: string) => {
-				if (parameterName === 'options.queryBatching') {
-					return 'single';
-				}
-				if (parameterName === 'query') {
-					return 'INSERT INTO my_test_table VALUES (`{{ $json.name }}`)';
-				}
+	it('should not modify the original data object', () => {
+		const referenceItem = {
+			arr: [1, 2, 3],
+		};
+		const item = {
+			arr: [1, 2, 3],
+		};
+		const schema: ColumnInfo[] = [
+			{
+				column_name: 'arr',
+				data_type: 'ARRAY',
+				is_nullable: 'YES',
+				udt_name: '_int4',
+				column_default: null,
 			},
-			addExecutionHints: jest.fn(),
-		} as unknown as IExecuteFunctions;
+		];
 
-		addExecutionHints(context, [{ json: {} }, { json: {} }], 'executeQuery', false);
-		expect(context.addExecutionHints).toHaveBeenCalledWith({
-			message:
-				"Inserts were batched for performance. If you need to preserve item matching, consider changing 'Query batching' to 'Independent' in the options.",
-			location: 'outputPane',
-		});
-	});
-	it('should add run per item hint to select operation', () => {
-		const context = {
-			addExecutionHints: jest.fn(),
-		} as unknown as IExecuteFunctions;
+		const result = convertArraysToPostgresFormat(item, schema, node, 0);
 
-		addExecutionHints(context, [{ json: {} }, { json: {} }], 'select', false);
-		expect(context.addExecutionHints).toHaveBeenCalledWith({
-			location: 'outputPane',
-			message:
-				"This node ran 2 times, once for each input item. To run for the first item only, enable 'execute once' in the node settings",
+		expect(result).toEqual({
+			arr: '{1,2,3}',
 		});
+		expect(item).toEqual(referenceItem);
 	});
 });

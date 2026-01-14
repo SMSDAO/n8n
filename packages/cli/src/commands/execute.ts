@@ -1,32 +1,34 @@
+import { WorkflowRepository } from '@n8n/db';
+import { Command } from '@n8n/decorators';
 import { Container } from '@n8n/di';
-import { Flags } from '@oclif/core';
 import type { IWorkflowBase, IWorkflowExecutionDataProcess } from 'n8n-workflow';
 import { ExecutionBaseError, UnexpectedError, UserError } from 'n8n-workflow';
+import { z } from 'zod';
 
 import { ActiveExecutions } from '@/active-executions';
-import { WorkflowRepository } from '@/databases/repositories/workflow.repository';
 import { OwnershipService } from '@/services/ownership.service';
 import { findCliWorkflowStart, isWorkflowIdValid } from '@/utils';
 import { WorkflowRunner } from '@/workflow-runner';
 
 import { BaseCommand } from './base-command';
 
-export class Execute extends BaseCommand {
-	static description = '\nExecutes a given workflow';
+const flagsSchema = z.object({
+	id: z.string().describe('id of the workflow to execute').optional(),
+	rawOutput: z.boolean().describe('Outputs only JSON data, with no other text').optional(),
+	/**@deprecated */
+	file: z.string().describe('DEPRECATED: Please use --id instead').optional(),
+});
 
-	static examples = ['$ n8n execute --id=5'];
-
-	static flags = {
-		help: Flags.help({ char: 'h' }),
-		id: Flags.string({
-			description: 'id of the workflow to execute',
-		}),
-		rawOutput: Flags.boolean({
-			description: 'Outputs only JSON data, with no other text',
-		}),
-	};
-
+@Command({
+	name: 'execute',
+	description: 'Executes a given workflow',
+	examples: ['--id=5'],
+	flagsSchema,
+})
+export class Execute extends BaseCommand<z.infer<typeof flagsSchema>> {
 	override needsCommunityPackages = true;
+
+	override needsTaskRunner = true;
 
 	async init() {
 		await super.init();
@@ -36,7 +38,7 @@ export class Execute extends BaseCommand {
 	}
 
 	async run() {
-		const { flags } = await this.parse(Execute);
+		const { flags } = this;
 
 		if (!flags.id) {
 			this.logger.info('"--id" has to be set!');
@@ -81,7 +83,16 @@ export class Execute extends BaseCommand {
 			userId: user.id,
 		};
 
-		const executionId = await Container.get(WorkflowRunner).run(runData);
+		const workflowRunner = Container.get(WorkflowRunner);
+
+		if (this.globalConfig.executions.mode === 'queue') {
+			this.logger.warn(
+				'CLI command `execute` does not support queue mode. Falling back to regular mode.',
+			);
+			this.globalConfig.executions.mode = 'regular';
+		}
+
+		const executionId = await workflowRunner.run(runData);
 
 		const activeExecutions = Container.get(ActiveExecutions);
 		const data = await activeExecutions.getPostExecutePromise(executionId);
@@ -97,7 +108,7 @@ export class Execute extends BaseCommand {
 			this.logger.info(JSON.stringify(data, null, 2));
 
 			const { error } = data.data.resultData;
-			// eslint-disable-next-line @typescript-eslint/no-throw-literal
+			// eslint-disable-next-line @typescript-eslint/only-throw-error
 			throw {
 				...error,
 				stack: error.stack,
