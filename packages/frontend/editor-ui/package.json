@@ -68,7 +68,7 @@
     "highlight.js": "catalog:frontend",
     "humanize-duration": "^3.27.2",
     "jsonpath": "^1.1.1",
-    "lodash-es": "^4.17.21",
+    "lodash-es": "^4.17.23",
     "luxon": "catalog:",
     "n8n-workflow": "workspace:*",
     "pinia": "^2.2.4",
