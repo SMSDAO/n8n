@@ -67,7 +67,7 @@
     "flatted": "catalog:",
     "highlight.js": "catalog:frontend",
     "humanize-duration": "^3.27.2",
-    "jsonpath": "^1.1.1",
+    "jsonpath": "^1.2.0",
     "lodash-es": "^4.17.21",
     "luxon": "catalog:",
     "n8n-workflow": "workspace:*",
