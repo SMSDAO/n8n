@@ -43,7 +43,7 @@
     "@n8n/di": "workspace:*",
     "@sentry/node": "catalog:",
     "aws4": "1.11.0",
-    "axios": "catalog:",
+    "axios": "1.13.5",
     "callsites": "catalog:",
     "chardet": "2.0.0",
     "concat-stream": "2.0.0",
