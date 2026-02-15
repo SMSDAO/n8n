@@ -41,7 +41,7 @@
     "markdown-it-link-attributes": "^4.0.1",
     "uuid": "catalog:",
     "vue": "catalog:frontend",
-    "vue-markdown-render": "2.3.0"
+    "vue-markdown-render": "catalog:frontend"
   },
   "devDependencies": {
     "@iconify-json/mdi": "^1.1.54",
